@@ -1,0 +1,43 @@
+name: Build macOS binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: echofs-macos-arm64-zh
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: echofs-macos-x64-zh
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.target }}/release/echofs ./${{ matrix.asset }}
+          ls -la ./${{ matrix.asset }}
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.6.0-zh ./${{ matrix.asset }} --clobber --repo ${{ github.repository }}

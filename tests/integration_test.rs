@@ -1,0 +1,2236 @@
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::routing::get;
+use axum::Router;
+use http_body_util::BodyExt;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tower::ServiceExt;
+
+use echofs::handlers::{self, AppState};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Test environment: creates a temp directory and provides helpers
+/// for building routers and making requests.
+struct TestEnv {
+    root: PathBuf,
+    show_hidden: bool,
+    max_depth: i32,
+    webdav: bool,
+    webdav_user: Option<String>,
+    webdav_pass: Option<String>,
+    webui_auth: bool,
+    _tmp: tempfile::TempDir, // prevent cleanup until TestEnv is dropped
+}
+
+impl TestEnv {
+    /// Create a new test environment with default options.
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        Self { root, show_hidden: false, max_depth: -1, webdav: false, webdav_user: None, webdav_pass: None, webui_auth: false, _tmp: tmp }
+    }
+
+    /// Create a test environment rooted at an arbitrary path (possibly a
+    /// non-canonicalized path such as a symlink), holding the tempdir alive.
+    fn from_root(root: PathBuf, tmp: tempfile::TempDir) -> Self {
+        Self { root, show_hidden: false, max_depth: -1, webdav: false, webdav_user: None, webdav_pass: None, webui_auth: false, _tmp: tmp }
+    }
+
+    fn show_hidden(mut self) -> Self {
+        self.show_hidden = true;
+        self
+    }
+
+    fn max_depth(mut self, d: i32) -> Self {
+        self.max_depth = d;
+        self
+    }
+
+    fn webdav(mut self) -> Self {
+        self.webdav = true;
+        self
+    }
+
+    fn auth(mut self, user: &str, pass: &str) -> Self {
+        self.webdav_user = Some(user.to_string());
+        self.webdav_pass = Some(pass.to_string());
+        self
+    }
+
+    fn webui_auth(mut self) -> Self {
+        self.webui_auth = true;
+        self
+    }
+
+    /// Write a file relative to root (creates parent dirs as needed).
+    fn write(&self, path: &str, content: &str) -> &Self {
+        let full = self.root.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(full, content).unwrap();
+        self
+    }
+
+    /// Write raw bytes to a file.
+    fn write_bytes(&self, path: &str, content: &[u8]) -> &Self {
+        let full = self.root.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(full, content).unwrap();
+        self
+    }
+
+    /// Create a directory (including parents) relative to root.
+    fn mkdir(&self, path: &str) -> &Self {
+        fs::create_dir_all(self.root.join(path)).unwrap();
+        self
+    }
+
+    /// Build a Router from the current configuration.
+    fn router(&self) -> Router {
+        let state = Arc::new(AppState {
+            root: self.root.clone(),
+            show_hidden: self.show_hidden,
+            max_depth: self.max_depth,
+            speed_limit: None,
+            webdav: self.webdav,
+            webdav_user: self.webdav_user.clone(),
+            webdav_pass: self.webdav_pass.clone(),
+            webui_auth: self.webui_auth,
+        });
+        let mut router = Router::new()
+            .route("/", get(handlers::serve_index))
+            .route("/{*path}", get(handlers::serve_path));
+        if self.webdav {
+            router = router
+                .route("/", axum::routing::any(echofs::webdav::handle_webdav_root))
+                .route("/{*path}", axum::routing::any(echofs::webdav::handle_webdav_path));
+        }
+        if self.webui_auth {
+            router = router.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                echofs::server::webui_auth_middleware,
+            ));
+        }
+        router.with_state(state)
+    }
+
+    /// Send a GET request and return the response.
+    async fn get(&self, uri: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a GET request with XHR header (returns JSON from server).
+    async fn xhr(&self, uri: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(
+                Request::get(uri)
+                    .header("X-Requested-With", "XMLHttpRequest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a HEAD request.
+    async fn head(&self, uri: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(Request::head(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a GET request with a Range header.
+    async fn get_range(&self, uri: &str, range: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(
+                Request::get(uri)
+                    .header(header::RANGE, range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a PROPFIND request with a Depth header.
+    async fn propfind(&self, uri: &str, depth: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("PROPFIND")
+                    .uri(uri)
+                    .header("Depth", depth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a request with an arbitrary method.
+    async fn method(&self, method: &str, uri: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a request with an arbitrary method and body.
+    async fn method_with_body(&self, method: &str, uri: &str, body: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a LOCK request.
+    async fn lock(&self, uri: &str) -> TestResponse {
+        self.method("LOCK", uri).await
+    }
+
+    /// Send an UNLOCK request with a Lock-Token header.
+    async fn unlock(&self, uri: &str) -> TestResponse {
+        let resp = self
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("UNLOCK")
+                    .uri(uri)
+                    .header("Lock-Token", "<opaquelocktoken:test>")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send a request with arbitrary method, body, and Basic Auth.
+    async fn authed(&self, method: &str, uri: &str, body: &str, user: &str, pass: &str) -> TestResponse {
+        use std::fmt::Write;
+        // Simple base64 encode for "user:pass"
+        let credentials = format!("{}:{}", user, pass);
+        let encoded = simple_base64_encode(credentials.as_bytes());
+        let auth_value = format!("Basic {}", encoded);
+        let resp = self
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", &auth_value)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+
+    /// Send an authenticated request with extra headers.
+    async fn authed_with_headers(&self, method: &str, uri: &str, body: &str, user: &str, pass: &str, extra_headers: Vec<(&str, &str)>) -> TestResponse {
+        let credentials = format!("{}:{}", user, pass);
+        let encoded = simple_base64_encode(credentials.as_bytes());
+        let auth_value = format!("Basic {}", encoded);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", &auth_value);
+        for (k, v) in extra_headers {
+            builder = builder.header(k, v);
+        }
+        let resp = self
+            .router()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        TestResponse(resp)
+    }
+}
+
+/// Simple base64 encoder for test auth headers.
+fn simple_base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i] as u32;
+        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        let remaining = data.len() - i;
+        result.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if remaining > 1 {
+            result.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if remaining > 2 {
+            result.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        i += 3;
+    }
+    result
+}
+
+/// Wrapper around an HTTP response providing convenient assertion methods.
+struct TestResponse(axum::http::Response<Body>);
+
+impl TestResponse {
+    fn status(&self) -> StatusCode {
+        self.0.status()
+    }
+
+    fn assert_status(self, expected: StatusCode) -> Self {
+        assert_eq!(self.0.status(), expected, "unexpected status code");
+        self
+    }
+
+    fn header(&self, name: &str) -> Option<String> {
+        self.0.headers().get(name).map(|v| v.to_str().unwrap().to_string())
+    }
+
+    fn assert_header(self, name: &str, expected: &str) -> Self {
+        let val = self.header(name).unwrap_or_else(|| panic!("missing header: {}", name));
+        assert_eq!(val, expected, "header {} mismatch", name);
+        self
+    }
+
+    fn assert_header_contains(self, name: &str, substr: &str) -> Self {
+        let val = self.header(name).unwrap_or_else(|| panic!("missing header: {}", name));
+        assert!(val.contains(substr), "header {} = {:?} doesn't contain {:?}", name, val, substr);
+        self
+    }
+
+    fn assert_header_exists(self, name: &str) -> Self {
+        assert!(self.0.headers().get(name).is_some(), "missing header: {}", name);
+        self
+    }
+
+    /// Consume response and return body as string.
+    async fn text(self) -> String {
+        let bytes = self.0.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Consume response and return raw body bytes.
+    async fn bytes(self) -> Vec<u8> {
+        self.0.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    /// Consume response and return parsed JSON.
+    async fn json(self) -> serde_json::Value {
+        let text = self.text().await;
+        serde_json::from_str(&text).unwrap()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JSON API (via X-Requested-With header)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_root_json_structure() {
+    let env = TestEnv::new();
+    env.write("file.txt", "hello");
+    env.mkdir("dir");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    assert!(json["path"].is_string());
+    assert!(json["breadcrumbs"].is_array());
+    assert!(json["entries"].is_array());
+}
+
+#[tokio::test]
+async fn api_subdir_json() {
+    let env = TestEnv::new();
+    env.write("sub/inner.txt", "data");
+
+    let json = env.xhr("/sub").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "inner.txt");
+}
+
+#[tokio::test]
+async fn api_hidden_files_excluded() {
+    let env = TestEnv::new();
+    env.write(".hidden", "secret");
+    env.write("visible.txt", "ok");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "visible.txt");
+}
+
+#[tokio::test]
+async fn api_dirs_sorted_before_files() {
+    let env = TestEnv::new();
+    env.write("afile.txt", "a");
+    env.mkdir("zdir");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert!(entries[0]["is_dir"].as_bool().unwrap());
+    assert!(!entries[1]["is_dir"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn api_nonexistent_dir_404() {
+    let env = TestEnv::new();
+    env.xhr("/nonexistent").await.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_entry_fields() {
+    let env = TestEnv::new();
+    env.write("test.txt", "content");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    let entry = &json["entries"][0];
+    assert!(entry["name"].is_string());
+    assert!(entry["is_dir"].is_boolean());
+    assert!(entry["size"].is_number());
+    assert!(entry["size_display"].is_string());
+    assert!(entry["icon"].is_string());
+    assert!(entry["href"].is_string());
+    assert!(entry["media_type"].is_string());
+}
+
+#[tokio::test]
+async fn api_breadcrumbs() {
+    let env = TestEnv::new();
+    env.mkdir("a/b");
+
+    let json = env.xhr("/a/b").await.assert_status(StatusCode::OK).json().await;
+    let crumbs = json["breadcrumbs"].as_array().unwrap();
+    assert_eq!(crumbs.len(), 3);
+    assert_eq!(crumbs[0]["name"], "Home");
+    assert_eq!(crumbs[1]["name"], "a");
+    assert_eq!(crumbs[2]["name"], "b");
+}
+
+/// Regression: requesting a directory via a trailing-slash URL (e.g. a browser
+/// refresh on `/sub/`) used to produce `path: "/sub/"` and entry hrefs with a
+/// doubled separator (`/sub//child`). Those doubled slashes then propagated as
+/// the user navigated deeper, making the folder structure look "duplicated".
+/// The server now normalizes the relative path before generating hrefs/path,
+/// so all of `/sub`, `/sub/`, and `/sub//child` return the same clean output.
+#[tokio::test]
+async fn api_trailing_slash_normalizes_hrefs() {
+    let env = TestEnv::new();
+    env.write("sub/inner.txt", "data");
+    env.mkdir("sub/child");
+
+    for uri in ["/sub", "/sub/", "/sub//"] {
+        let json = env.xhr(uri).await.assert_status(StatusCode::OK).json().await;
+        // path is normalized — no trailing slash, no doubled separators.
+        assert_eq!(json["path"], "/sub", "uri={uri} should normalize path");
+        let entries = json["entries"].as_array().unwrap();
+        let by_name: std::collections::HashMap<&str, &serde_json::Value> =
+            entries.iter().map(|e| (e["name"].as_str().unwrap(), e)).collect();
+        // hrefs are clean single-slash paths.
+        assert_eq!(by_name["child"]["href"], "/sub/child", "uri={uri} child href");
+        assert_eq!(by_name["inner.txt"]["href"], "/sub/inner.txt", "uri={uri} file href");
+    }
+}
+
+/// Regression: doubled separators in the *middle* of the request path
+/// (`/a//b`) must also normalize so hrefs don't compound into `/a//b/c`.
+#[tokio::test]
+async fn api_double_slash_in_path_normalizes_hrefs() {
+    let env = TestEnv::new();
+    env.write("a/b/c.txt", "data");
+
+    let json = env.xhr("/a//b").await.assert_status(StatusCode::OK).json().await;
+    assert_eq!(json["path"], "/a/b");
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["href"], "/a/b/c.txt");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AJAX dispatch: same path returns HTML or JSON
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn root_without_xhr_returns_html_with_xhr_returns_json() {
+    let env = TestEnv::new();
+    env.write("file.txt", "hello");
+
+    // Without XHR header → HTML
+    let body = env.get("/").await.assert_status(StatusCode::OK).text().await;
+    assert!(body.contains("<!DOCTYPE html>"));
+
+    // With XHR header → JSON
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    assert!(json["entries"].is_array());
+}
+
+#[tokio::test]
+async fn subdir_without_xhr_returns_html_with_xhr_returns_json() {
+    let env = TestEnv::new();
+    env.write("mydir/test.txt", "data");
+
+    // Without XHR header → HTML
+    let body = env.get("/mydir").await.assert_status(StatusCode::OK).text().await;
+    assert!(body.contains("<!DOCTYPE html>"));
+
+    // With XHR header → JSON
+    let json = env.xhr("/mydir").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "test.txt");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// File serving
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn serve_file_full_content() {
+    let env = TestEnv::new();
+    env.write("hello.txt", "Hello, world!");
+
+    let resp = env.get("/hello.txt").await.assert_status(StatusCode::OK);
+    let resp = resp
+        .assert_header("accept-ranges", "bytes")
+        .assert_header("content-length", "13")
+        .assert_header_contains("content-type", "text/plain");
+    assert_eq!(resp.text().await, "Hello, world!");
+}
+
+#[tokio::test]
+async fn serve_file_range_206() {
+    let env = TestEnv::new();
+    env.write("data.txt", "0123456789");
+
+    let resp = env.get_range("/data.txt", "bytes=0-4").await;
+    let resp = resp.assert_status(StatusCode::PARTIAL_CONTENT).assert_header_exists("content-range");
+    assert_eq!(resp.text().await, "01234");
+}
+
+#[tokio::test]
+async fn serve_file_invalid_range_416() {
+    let env = TestEnv::new();
+    env.write("data.txt", "0123456789");
+
+    env.get_range("/data.txt", "bytes=100-200")
+        .await
+        .assert_status(StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+#[tokio::test]
+async fn serve_file_suffix_range() {
+    let env = TestEnv::new();
+    env.write("data.txt", "0123456789");
+
+    let resp = env.get_range("/data.txt", "bytes=-3").await.assert_status(StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.text().await, "789");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Security
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn hidden_file_direct_access_denied() {
+    let env = TestEnv::new();
+    env.write(".env", "SECRET=key");
+    env.get("/.env").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn hidden_dir_child_access_denied() {
+    let env = TestEnv::new();
+    env.write(".git/config", "[core]");
+    env.get("/.git/config").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn hidden_file_percent_encoded_denied() {
+    let env = TestEnv::new();
+    env.write(".env", "SECRET=key");
+
+    let status = env.get("/%2Eenv").await.status();
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "expected 403 or 404, got {}", status
+    );
+}
+
+#[tokio::test]
+async fn path_traversal_denied() {
+    let env = TestEnv::new();
+
+    let status = env.get("/..%2F..%2F..%2Fetc%2Fpasswd").await.status();
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "expected 403 or 404, got {}", status
+    );
+}
+
+#[tokio::test]
+async fn nonexistent_file_404() {
+    let env = TestEnv::new();
+    env.get("/no-such-file.txt").await.assert_status(StatusCode::NOT_FOUND);
+}
+
+/// Regression: the `Path` extractor already percent-decodes; the handlers used
+/// to decode a second time, so a file literally named `a%20b.txt` was listed
+/// with href `/a%2520b.txt` while that href resolved to `a b.txt` (404).
+#[tokio::test]
+async fn percent_in_filename_round_trips() {
+    let env = TestEnv::new().webdav();
+    env.write("a%20b.txt", "pct");
+
+    // The listing hands out the single-encoded form.
+    let json = env.xhr("/").await.json().await;
+    let entry = json["entries"].as_array().unwrap().iter()
+        .find(|e| e["name"] == "a%20b.txt")
+        .expect("entry listed");
+    assert_eq!(entry["href"], "/a%2520b.txt");
+
+    // And that href resolves back to the file.
+    let body = env.get("/a%2520b.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "pct");
+}
+
+/// Regression: the served root may itself be reached via a symlink (or a
+/// non-canonical path). Before the fix, the path-traversal guard compared a
+/// *canonicalized* parent against the *non-canonicalized* root, so when the
+/// root was a symlink the two forms never matched — legitimate files inside
+/// the root were wrongly rejected (403), and the comparison basis was unsound.
+/// The guard now canonicalizes the root too, so access inside a symlinked root
+/// works while traversal outside it is still denied.
+#[tokio::test]
+async fn symlinked_root_resolves_correctly_and_blocks_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("inside.txt"), "ok").unwrap();
+
+    // A symlink `link -> real` serves as the (non-canonical) root.
+    let link = tmp.path().join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    #[cfg(windows)]
+    {
+        // Create a directory symlink; if the platform denies it, fall back to
+        // a directory junction so the test still exercises a non-canonical root.
+        match std::os::windows::fs::symlink_dir(&real, &link) {
+            Ok(()) => {}
+            Err(_) => {
+                // Junction creation requires a raw command; skip cleanly if unavailable.
+                let out = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(&real)
+                    .output();
+                if out.is_err() || !out.unwrap().status.success() {
+                    // Environment cannot create symlinks/junctions — skip.
+                    eprintln!("symlink/junction unsupported, skipping");
+                    return;
+                }
+            }
+        }
+    }
+
+    // Root the server at the symlink (NOT the canonicalized real path).
+    let env = TestEnv::from_root(link.clone(), tmp);
+
+    // Legitimate access through the symlinked root must succeed (was 403 before).
+    let body = env.get("/inside.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "ok");
+
+    // Traversal outside the (symlinked) root must still be denied.
+    let status = env.get("/..%2F..%2F..%2Fetc%2Fpasswd").await.status();
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "expected 403 or 404, got {}",
+        status
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Error page HTML vs JSON
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn browser_404_returns_html_error_page() {
+    let env = TestEnv::new();
+
+    let resp = env.get("/no-such-file.txt").await.assert_status(StatusCode::NOT_FOUND);
+    let resp = resp.assert_header_contains("content-type", "text/html");
+    let body = resp.text().await;
+    assert!(body.contains("<!DOCTYPE html>"));
+    assert!(body.contains("404"));
+    assert!(body.contains("Not Found"));
+    assert!(body.contains("Back to Home"));
+}
+
+#[tokio::test]
+async fn xhr_404_returns_json_error() {
+    let env = TestEnv::new();
+
+    let resp = env.xhr("/no-such-file.txt").await.assert_status(StatusCode::NOT_FOUND);
+    let resp = resp.assert_header_contains("content-type", "application/json");
+    let json = resp.json().await;
+    assert!(json["error"].is_string());
+}
+
+#[tokio::test]
+async fn browser_403_returns_html_error_page() {
+    let env = TestEnv::new();
+    env.write(".env", "SECRET=key");
+
+    let resp = env.get("/.env").await.assert_status(StatusCode::FORBIDDEN);
+    let resp = resp.assert_header_contains("content-type", "text/html");
+    let body = resp.text().await;
+    assert!(body.contains("403"));
+    assert!(body.contains("Forbidden"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEAD method support
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn head_root_returns_ok_no_body() {
+    let env = TestEnv::new();
+
+    let body = env.head("/").await.assert_status(StatusCode::OK).text().await;
+    assert!(body.is_empty(), "HEAD response should have no body");
+}
+
+#[tokio::test]
+async fn head_file_returns_headers_no_body() {
+    let env = TestEnv::new();
+    env.write("hello.txt", "Hello, world!");
+
+    let resp = env.head("/hello.txt").await.assert_status(StatusCode::OK);
+    let resp = resp
+        .assert_header_exists("content-type")
+        .assert_header_exists("content-length")
+        .assert_header("accept-ranges", "bytes");
+    let body = resp.text().await;
+    assert!(body.is_empty(), "HEAD response should have no body");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MIME types
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn serve_png_with_correct_mime() {
+    let env = TestEnv::new();
+    // Minimal valid PNG (1x1 transparent pixel)
+    let png_data: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+        0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54,
+        0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5,
+        0x27, 0xDE, 0xFC,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+        0xAE, 0x42, 0x60, 0x82,
+    ];
+    env.write_bytes("image.png", png_data);
+
+    env.get("/image.png")
+        .await
+        .assert_status(StatusCode::OK)
+        .assert_header("content-type", "image/png");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// show_hidden tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn show_hidden_allows_dotfile_access() {
+    let env = TestEnv::new().show_hidden();
+    env.write(".env", "SECRET=key");
+
+    let body = env.get("/.env").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "SECRET=key");
+}
+
+#[tokio::test]
+async fn show_hidden_includes_dotfiles_in_listing() {
+    let env = TestEnv::new().show_hidden();
+    env.write(".hidden", "secret");
+    env.write("visible.txt", "ok");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&".hidden"));
+    assert!(names.contains(&"visible.txt"));
+}
+
+#[tokio::test]
+async fn show_hidden_still_blocks_path_traversal() {
+    let env = TestEnv::new().show_hidden();
+
+    let status = env.get("/..%2F..%2F..%2Fetc%2Fpasswd").await.status();
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "expected 403 or 404, got {}", status
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// max_depth tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn max_depth_blocks_deep_directory_access() {
+    let env = TestEnv::new().max_depth(0);
+    env.mkdir("a/b");
+    env.get("/a").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn max_depth_blocks_deep_file_access() {
+    let env = TestEnv::new().max_depth(0);
+    env.write("sub/secret.txt", "data");
+    env.get("/sub/secret.txt").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn max_depth_hides_subdirs_in_listing() {
+    let env = TestEnv::new().max_depth(0);
+    env.mkdir("mydir");
+    env.write("file.txt", "data");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "file.txt");
+    assert!(!entries[0]["is_dir"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn max_depth_allows_within_limit() {
+    let env = TestEnv::new().max_depth(1);
+    env.write("sub/file.txt", "hello");
+    env.write("file.txt", "root");
+
+    let json = env.xhr("/").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let has_dir = entries.iter().any(|e| e["is_dir"].as_bool().unwrap() && e["name"] == "sub");
+    assert!(has_dir, "root listing should include subdirectory when below max_depth");
+}
+
+#[tokio::test]
+async fn max_depth_unlimited_allows_deep_access() {
+    let env = TestEnv::new(); // default max_depth = -1 (unlimited)
+    env.write("a/b/c/deep.txt", "deep content");
+
+    let body = env.get("/a/b/c/deep.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "deep content");
+}
+
+#[tokio::test]
+async fn max_depth_zero_allows_root_file_access() {
+    let env = TestEnv::new().max_depth(0);
+    env.write("hello.txt", "hello world");
+
+    let body = env.get("/hello.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "hello world");
+}
+
+#[tokio::test]
+async fn max_depth_one_blocks_depth_two_dir() {
+    let env = TestEnv::new().max_depth(1);
+    env.mkdir("a/b");
+    env.get("/a/b").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn max_depth_boundary_at_exact_limit() {
+    let env = TestEnv::new().max_depth(2);
+    env.mkdir("a/b");
+
+    // depth=2 should allow /a/b (depth 2) — boundary is inclusive (<=)
+    env.xhr("/a/b").await.assert_status(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn max_depth_one_allows_file_in_allowed_dir() {
+    let env = TestEnv::new().max_depth(1);
+    env.write("sub/readme.txt", "hello");
+
+    let body = env.get("/sub/readme.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "hello");
+}
+
+#[tokio::test]
+async fn max_depth_one_blocks_file_in_deep_dir() {
+    let env = TestEnv::new().max_depth(1);
+    env.write("a/b/secret.txt", "data");
+    env.get("/a/b/secret.txt").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn max_depth_listing_hides_grandchild_dirs() {
+    let env = TestEnv::new().max_depth(1);
+    env.mkdir("sub/child");
+    env.write("sub/file.txt", "data");
+
+    // depth=1: listing of /sub (at depth 1 = max_depth) should hide child dirs
+    let json = env.xhr("/sub").await.assert_status(StatusCode::OK).json().await;
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "file.txt");
+    assert!(!entries[0]["is_dir"].as_bool().unwrap());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WebDAV Integration Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn webdav_options_returns_dav_header() {
+    let env = TestEnv::new().webdav();
+
+    let resp = env.method("OPTIONS", "/").await.assert_status(StatusCode::OK);
+    let resp = resp.assert_header("DAV", "1, 2");
+    let allow = resp.header("Allow").unwrap();
+    assert!(allow.contains("PROPFIND"));
+    assert!(allow.contains("LOCK"));
+}
+
+#[tokio::test]
+async fn webdav_propfind_root_depth_0() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "hello");
+    env.mkdir("subdir");
+
+    let body = env.propfind("/", "0").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("<D:multistatus"));
+    assert!(body.contains("<D:collection/>"));
+    // Depth 0 should NOT include children
+    assert!(!body.contains("file.txt"));
+    assert!(!body.contains("subdir"));
+}
+
+#[tokio::test]
+async fn webdav_propfind_root_depth_1() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "hello");
+    env.mkdir("subdir");
+
+    let body = env.propfind("/", "1").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("<D:multistatus"));
+    assert!(body.contains("<D:collection/>"));
+    assert!(body.contains("file.txt"));
+    assert!(body.contains("subdir"));
+}
+
+#[tokio::test]
+async fn webdav_propfind_file() {
+    let env = TestEnv::new().webdav();
+    env.write("readme.txt", "content here");
+
+    let body = env.propfind("/readme.txt", "0").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("<D:resourcetype/>"));
+    assert!(body.contains("<D:getcontentlength>12</D:getcontentlength>"));
+    assert!(body.contains("text/plain"));
+    assert!(body.contains("readme.txt"));
+}
+
+#[tokio::test]
+async fn webdav_propfind_nonexistent_returns_404() {
+    let env = TestEnv::new().webdav();
+    env.propfind("/nonexistent", "0").await.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn webdav_propfind_hidden_file_returns_403() {
+    let env = TestEnv::new().webdav();
+    env.write(".secret", "hidden");
+    env.propfind("/.secret", "0").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn webdav_propfind_hidden_file_allowed_with_show_hidden() {
+    let env = TestEnv::new().webdav().show_hidden();
+    env.write(".secret", "hidden");
+
+    let body = env.propfind("/.secret", "0").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains(".secret"));
+}
+
+#[tokio::test]
+async fn webdav_propfind_subdirectory_depth_1() {
+    let env = TestEnv::new().webdav();
+    env.write("docs/a.txt", "aaa");
+    env.write("docs/b.txt", "bbb");
+
+    let body = env.propfind("/docs", "1").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("a.txt"));
+    assert!(body.contains("b.txt"));
+    assert!(body.contains("<D:collection/>"));
+}
+
+/// Regression: hrefs returned by PROPFIND must percent-encode every path
+/// segment, including *parent* directory names. Before the fix, only the
+/// leaf entry name was encoded — a parent directory containing a space or `#`
+/// leaked its raw characters into the href (e.g. `/my dir/#1/`), which WebDAV
+/// clients parsed as a fragment and resolved to the wrong resource.
+#[tokio::test]
+async fn webdav_propfind_href_encodes_parent_segments() {
+    let env = TestEnv::new().webdav();
+    env.write("my dir/#1/child file.txt", "data");
+
+    let body = env
+        .propfind("/my%20dir/%231", "1")
+        .await
+        .assert_status(StatusCode::MULTI_STATUS)
+        .text()
+        .await;
+
+    // The child href must be fully encoded: `/my%20dir/%231/child%20file.txt`.
+    assert!(body.contains("my%20dir/%231/child%20file.txt"),
+        "child href must encode parent segments; got:\n{body}");
+    // No raw (unescaped) space or '#' may appear inside a <D:href>.
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some(inner) = t.strip_prefix("<D:href>").and_then(|s| s.strip_suffix("</D:href>")) {
+            assert!(!inner.contains(' '), "href {inner:?} must not contain a raw space");
+            assert!(!inner.contains('#'), "href {inner:?} must not contain a raw '#'");
+        }
+    }
+}
+
+#[tokio::test]
+async fn webdav_propfind_without_webdav_flag_returns_405() {
+    let env = TestEnv::new(); // webdav NOT enabled
+    env.propfind("/", "0").await.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn webdav_options_on_subpath() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("folder");
+
+    env.method("OPTIONS", "/folder")
+        .await
+        .assert_status(StatusCode::OK)
+        .assert_header("DAV", "1, 2");
+}
+
+#[tokio::test]
+async fn webdav_lock_returns_lock_token() {
+    let env = TestEnv::new().webdav();
+
+    let resp = env.lock("/").await.assert_status(StatusCode::OK).assert_header_exists("Lock-Token");
+    let body = resp.text().await;
+    assert!(body.contains("<D:lockdiscovery>"));
+    assert!(body.contains("<D:locktoken>"));
+}
+
+#[tokio::test]
+async fn webdav_unlock_returns_no_content() {
+    let env = TestEnv::new().webdav();
+    env.unlock("/").await.assert_status(StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn webdav_put_creates_file() {
+    let env = TestEnv::new().webdav();
+    env.method_with_body("PUT", "/newfile.txt", "data").await.assert_status(StatusCode::CREATED);
+    // Verify file was created
+    assert!(env.root.join("newfile.txt").exists());
+    assert_eq!(std::fs::read_to_string(env.root.join("newfile.txt")).unwrap(), "data");
+}
+
+#[tokio::test]
+async fn webdav_put_requires_auth_when_configured() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.method_with_body("PUT", "/newfile.txt", "data").await.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webdav_delete_removes_file() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+    env.method("DELETE", "/file.txt").await.assert_status(StatusCode::NO_CONTENT);
+    assert!(!env.root.join("file.txt").exists());
+}
+
+#[tokio::test]
+async fn webdav_delete_requires_auth_when_configured() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "data");
+    env.method("DELETE", "/file.txt").await.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webdav_propfind_includes_supportedlock() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "hello");
+
+    let body = env.propfind("/", "1").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("<D:supportedlock>"));
+    assert!(body.contains("<D:getetag>"));
+    assert!(body.contains("<D:creationdate>") || body.contains("<D:getlastmodified>"));
+
+    // Also test max_depth enforcement via WebDAV
+    let env2 = TestEnv::new().webdav().max_depth(0);
+    env2.mkdir("a/b");
+    env2.write("a/b/deep.txt", "data");
+    env2.propfind("/a", "0").await.assert_status(StatusCode::FORBIDDEN);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WebDAV Write Operation Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn webdav_put_overwrites_existing_file() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "old");
+    env.method_with_body("PUT", "/file.txt", "new").await.assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(std::fs::read_to_string(env.root.join("file.txt")).unwrap(), "new");
+}
+
+#[tokio::test]
+async fn webdav_put_with_correct_auth_succeeds() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.authed("PUT", "/newfile.txt", "data", "admin", "secret").await.assert_status(StatusCode::CREATED);
+    assert!(env.root.join("newfile.txt").exists());
+}
+
+#[tokio::test]
+async fn webdav_put_with_wrong_auth_fails() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.authed("PUT", "/newfile.txt", "data", "admin", "wrong").await.assert_status(StatusCode::UNAUTHORIZED);
+    assert!(!env.root.join("newfile.txt").exists());
+}
+
+#[tokio::test]
+async fn webdav_mkcol_creates_directory() {
+    let env = TestEnv::new().webdav();
+    env.method("MKCOL", "/newdir").await.assert_status(StatusCode::CREATED);
+    assert!(env.root.join("newdir").is_dir());
+}
+
+#[tokio::test]
+async fn webdav_mkcol_conflict_if_exists() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("existing");
+    env.method("MKCOL", "/existing").await.assert_status(StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn webdav_mkcol_requires_auth() {
+    let env = TestEnv::new().webdav().auth("user", "pass");
+    env.method("MKCOL", "/newdir").await.assert_status(StatusCode::UNAUTHORIZED);
+    assert!(!env.root.join("newdir").exists());
+}
+
+#[tokio::test]
+async fn webdav_delete_removes_directory() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("mydir");
+    env.write("mydir/file.txt", "data");
+    env.method("DELETE", "/mydir").await.assert_status(StatusCode::NO_CONTENT);
+    assert!(!env.root.join("mydir").exists());
+}
+
+#[tokio::test]
+async fn webdav_delete_nonexistent_returns_404() {
+    let env = TestEnv::new().webdav();
+    env.method("DELETE", "/nonexistent.txt").await.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn webdav_copy_file() {
+    let env = TestEnv::new().webdav();
+    env.write("source.txt", "hello");
+    env.authed_with_headers("COPY", "/source.txt", "", "", "", vec![("Destination", "/dest.txt")]).await.assert_status(StatusCode::CREATED);
+    assert!(env.root.join("dest.txt").exists());
+    assert_eq!(std::fs::read_to_string(env.root.join("dest.txt")).unwrap(), "hello");
+    // Source should still exist
+    assert!(env.root.join("source.txt").exists());
+}
+
+#[tokio::test]
+async fn webdav_move_file() {
+    let env = TestEnv::new().webdav();
+    env.write("source.txt", "hello");
+    env.authed_with_headers("MOVE", "/source.txt", "", "", "", vec![("Destination", "/dest.txt")]).await.assert_status(StatusCode::CREATED);
+    assert!(env.root.join("dest.txt").exists());
+    assert_eq!(std::fs::read_to_string(env.root.join("dest.txt")).unwrap(), "hello");
+    // Source should be gone
+    assert!(!env.root.join("source.txt").exists());
+}
+
+#[tokio::test]
+async fn webdav_move_requires_destination_header() {
+    let env = TestEnv::new().webdav();
+    env.write("source.txt", "hello");
+    env.method("MOVE", "/source.txt").await.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn webdav_copy_overwrite_false_conflicts() {
+    let env = TestEnv::new().webdav();
+    env.write("source.txt", "hello");
+    env.write("dest.txt", "existing");
+    env.authed_with_headers("COPY", "/source.txt", "", "", "", vec![("Destination", "/dest.txt"), ("Overwrite", "F")]).await.assert_status(StatusCode::CONFLICT);
+    // dest.txt should be unchanged
+    assert_eq!(std::fs::read_to_string(env.root.join("dest.txt")).unwrap(), "existing");
+}
+
+/// Regression: `DELETE /` resolved to the root itself and `remove_dir_all`ed
+/// the entire served tree. The root must now be refused.
+#[tokio::test]
+async fn webdav_delete_root_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.write("keep.txt", "data");
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+
+    env.method("DELETE", "/").await.assert_status(StatusCode::FORBIDDEN);
+
+    assert!(env.root.join("keep.txt").exists());
+    assert!(env.root.join("sub/inner.txt").exists());
+}
+
+/// Regression: a spelling that resolves onto the root (here `/sub/..`) must
+/// hit the same guard as `DELETE /`. `show_hidden` is enabled so the request
+/// is not rejected earlier by the hidden-component rule (`..` starts with '.'
+/// when hidden files are blocked) — this pins the canonical-path guard itself.
+#[tokio::test]
+async fn webdav_delete_dotdot_spelling_resolving_to_root_is_refused() {
+    let env = TestEnv::new().webdav().show_hidden();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+
+    env.method("DELETE", "/sub/..").await.assert_status(StatusCode::FORBIDDEN);
+
+    assert!(env.root.join("sub/inner.txt").exists());
+}
+
+/// Regression: `COPY /` into a child of itself recursed without bound and
+/// crashed the process with a stack overflow. Destination-inside-source is a
+/// 409 per RFC 4918 §9.8.4; the source tree must be untouched.
+#[tokio::test]
+async fn webdav_copy_root_into_subdir_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+
+    env.authed_with_headers("COPY", "/", "", "", "", vec![("Destination", "/copy")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert!(env.root.join("file.txt").exists());
+    assert!(!env.root.join("copy").exists());
+}
+
+/// Regression: copying a directory onto itself used to run the overwrite
+/// pre-delete first, destroying the source before the copy ran.
+#[tokio::test]
+async fn webdav_copy_onto_itself_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+
+    env.authed_with_headers("COPY", "/sub", "", "", "", vec![("Destination", "/sub")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert_eq!(std::fs::read_to_string(env.root.join("sub/inner.txt")).unwrap(), "data");
+}
+
+/// Moving a directory into its own hierarchy is a 409 per RFC 4918 §9.9.4.
+#[tokio::test]
+async fn webdav_move_dir_into_itself_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+
+    env.authed_with_headers("MOVE", "/sub", "", "", "", vec![("Destination", "/sub/deep")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert!(env.root.join("sub/inner.txt").exists());
+    assert!(!env.root.join("deep").exists());
+}
+
+/// Regression: moving onto the same path used to run the overwrite pre-delete
+/// (deleting the source) before a rename that could no longer succeed.
+#[tokio::test]
+async fn webdav_move_onto_itself_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+
+    env.authed_with_headers("MOVE", "/sub", "", "", "", vec![("Destination", "/sub")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert!(env.root.join("sub/inner.txt").exists());
+}
+
+#[tokio::test]
+async fn webdav_move_file_onto_itself_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+
+    env.authed_with_headers("MOVE", "/file.txt", "", "", "", vec![("Destination", "/file.txt")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert_eq!(std::fs::read_to_string(env.root.join("file.txt")).unwrap(), "data");
+}
+
+/// Regression: moving a file onto a path that is an ancestor directory of
+/// that file used to run the overwrite pre-delete first — `remove_dir_all`
+/// on the destination removed the directory containing the source, losing
+/// the whole tree. Now a 409 with nothing touched.
+#[tokio::test]
+async fn webdav_move_file_onto_its_parent_dir_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+    env.write("other.txt", "keep");
+
+    env.authed_with_headers("MOVE", "/sub/inner.txt", "", "", "", vec![("Destination", "/sub")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert_eq!(std::fs::read_to_string(env.root.join("sub/inner.txt")).unwrap(), "data");
+    assert_eq!(std::fs::read_to_string(env.root.join("other.txt")).unwrap(), "keep");
+}
+
+/// Regression: copying a file onto its own path used to run the overwrite
+/// pre-delete (deleting the source) before a copy that could not succeed.
+#[tokio::test]
+async fn webdav_copy_file_onto_itself_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+
+    env.authed_with_headers("COPY", "/file.txt", "", "", "", vec![("Destination", "/file.txt")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert_eq!(std::fs::read_to_string(env.root.join("file.txt")).unwrap(), "data");
+}
+
+/// A file source must not overwrite a directory destination: the overwrite
+/// pre-delete would destroy the entire directory tree (RFC 4918 §9.8.5 —
+/// a collection is not replaced by a non-collection).
+#[tokio::test]
+async fn webdav_copy_file_onto_existing_dir_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+    env.mkdir("other");
+    env.write("other/inner.txt", "keep");
+
+    env.authed_with_headers("COPY", "/file.txt", "", "", "", vec![("Destination", "/other")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert!(env.root.join("other/inner.txt").exists());
+    assert!(env.root.join("file.txt").exists());
+}
+
+/// Exact-case directory names. Windows path lookups are case-insensitive, so
+/// `Path::exists()` cannot distinguish `file.txt` from `FILE.TXT` — only an
+/// enumeration can tell a case-only rename actually happened.
+#[cfg(windows)]
+fn exact_dir_names(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Regression (case-insensitive filesystems): `COPY /sub` with `Destination:
+/// /SUB` compared unequal as text, so the overwrite pre-delete removed the
+/// source directory itself. Canonicalized comparison catches the aliasing.
+/// (On case-sensitive platforms `/SUB` is simply a new sibling name and the
+/// copy is legitimate, so this test is Windows-only.)
+#[cfg(windows)]
+#[tokio::test]
+async fn webdav_copy_onto_case_variant_of_source_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+
+    env.authed_with_headers("COPY", "/sub", "", "", "", vec![("Destination", "/SUB")]).await.assert_status(StatusCode::CONFLICT);
+
+    assert_eq!(std::fs::read_to_string(env.root.join("sub/inner.txt")).unwrap(), "data");
+    assert!(!exact_dir_names(&env.root).iter().any(|n| n == "SUB"));
+}
+
+/// A case-only rename on Windows aliases the same canonical file; MOVE must
+/// skip the overwrite pre-delete (which would delete the source) and let the
+/// OS rename handle it. (On case-sensitive platforms this is a plain rename
+/// to a new name and never takes the aliasing path, so Windows-only.)
+#[cfg(windows)]
+#[tokio::test]
+async fn webdav_move_case_only_rename_succeeds() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+
+    env.authed_with_headers("MOVE", "/file.txt", "", "", "", vec![("Destination", "/FILE.TXT")]).await.assert_status(StatusCode::NO_CONTENT);
+
+    // Windows lookups are case-insensitive, so `file.txt.exists()` would
+    // still be true — enumerate to confirm the name really changed.
+    let names = exact_dir_names(&env.root);
+    assert!(!names.iter().any(|n| n == "file.txt"));
+    assert!(names.iter().any(|n| n == "FILE.TXT"));
+    assert_eq!(std::fs::read_to_string(env.root.join("FILE.TXT")).unwrap(), "data");
+}
+
+/// Destination URIs must not carry dot segments (RFC 3986 §5.2.4 leaves
+/// normalization to the client). A `..`-laden destination could otherwise
+/// resolve onto an ancestor of the source — or, with `--show-hidden`, out of
+/// the served root entirely — and the overwrite pre-delete would follow it.
+#[tokio::test]
+async fn webdav_move_with_dot_segments_in_destination_is_refused() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("sub");
+    env.write("sub/inner.txt", "data");
+    env.mkdir("x");
+
+    env.authed_with_headers("MOVE", "/sub", "", "", "", vec![("Destination", "/x/../sub2")]).await.assert_status(StatusCode::BAD_REQUEST);
+
+    assert!(env.root.join("sub/inner.txt").exists());
+    assert!(!env.root.join("sub2").exists());
+}
+
+/// Regression: the WebDAV path handler used to percent-decode a second time,
+/// so PUTs to names containing a literal `%` landed on the wrong path.
+#[tokio::test]
+async fn webdav_percent_in_filename_round_trips() {
+    let env = TestEnv::new().webdav();
+
+    env.method_with_body("PUT", "/a%2520b.txt", "pct").await.assert_status(StatusCode::CREATED);
+    assert!(env.root.join("a%20b.txt").exists());
+
+    let body = env.get("/a%2520b.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "pct");
+}
+
+#[tokio::test]
+async fn webdav_proppatch_returns_multistatus() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "data");
+    let body = env.method("PROPPATCH", "/file.txt").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("<D:multistatus"));
+    assert!(body.contains("HTTP/1.1 200 OK"));
+}
+
+#[tokio::test]
+async fn webdav_put_hidden_file_denied() {
+    let env = TestEnv::new().webdav();
+    env.method_with_body("PUT", "/.secret", "data").await.assert_status(StatusCode::FORBIDDEN);
+    assert!(!env.root.join(".secret").exists());
+}
+
+#[tokio::test]
+async fn webdav_put_hidden_file_allowed_with_show_hidden() {
+    let env = TestEnv::new().webdav().show_hidden();
+    env.method_with_body("PUT", "/.secret", "data").await.assert_status(StatusCode::CREATED);
+    assert!(env.root.join(".secret").exists());
+}
+
+#[tokio::test]
+async fn webdav_copy_with_auth() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("source.txt", "hello");
+    // Without auth → 401
+    env.authed_with_headers("COPY", "/source.txt", "", "", "", vec![("Destination", "/dest.txt")]).await.assert_status(StatusCode::UNAUTHORIZED);
+    // With auth → success
+    env.authed_with_headers("COPY", "/source.txt", "", "admin", "secret", vec![("Destination", "/dest.txt")]).await.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn webdav_options_includes_write_methods() {
+    let env = TestEnv::new().webdav();
+    let resp = env.method("OPTIONS", "/").await.assert_status(StatusCode::OK);
+    let allow = resp.header("Allow").unwrap();
+    assert!(allow.contains("PUT"));
+    assert!(allow.contains("DELETE"));
+    assert!(allow.contains("MKCOL"));
+    assert!(allow.contains("COPY"));
+    assert!(allow.contains("MOVE"));
+    assert!(allow.contains("PROPPATCH"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auth protects WebDAV operations only (not browser/web page access)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn auth_does_not_block_browser_get() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "hello");
+    // Browser GET should work without auth
+    let body = env.get("/file.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "hello");
+}
+
+#[tokio::test]
+async fn auth_does_not_block_browser_directory_listing() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "data");
+    // Browser directory listing should work without auth
+    env.get("/").await.assert_status(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn auth_blocks_propfind_when_configured() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "data");
+    env.propfind("/", "1").await.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_allows_propfind_with_correct_credentials() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "data");
+    let body = env.authed_with_headers("PROPFIND", "/", "", "admin", "secret", vec![("Depth", "1")]).await.assert_status(StatusCode::MULTI_STATUS).text().await;
+    assert!(body.contains("file.txt"));
+}
+
+#[tokio::test]
+async fn auth_blocks_all_webdav_methods() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "data");
+    // All WebDAV methods should require auth
+    env.propfind("/", "0").await.assert_status(StatusCode::UNAUTHORIZED);
+    env.method("MKCOL", "/newdir").await.assert_status(StatusCode::UNAUTHORIZED);
+    env.method_with_body("PUT", "/new.txt", "data").await.assert_status(StatusCode::UNAUTHORIZED);
+    env.method("DELETE", "/file.txt").await.assert_status(StatusCode::UNAUTHORIZED);
+    env.method("LOCK", "/").await.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn no_auth_allows_all_operations() {
+    // Without auth configured, everything is open
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "hello");
+    env.get("/file.txt").await.assert_status(StatusCode::OK);
+    env.propfind("/", "1").await.assert_status(StatusCode::MULTI_STATUS);
+    env.method_with_body("PUT", "/new.txt", "data").await.assert_status(StatusCode::CREATED);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JSON response includes webdav/webdav_auth fields
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn json_response_includes_webdav_true_when_enabled() {
+    let env = TestEnv::new().webdav();
+    env.write("file.txt", "hello");
+    let json = env.xhr("/").await.json().await;
+    assert_eq!(json["webdav"], true);
+    assert_eq!(json["webdav_auth"], false);
+    // Also verify entries still work
+    assert!(json["entries"].is_array());
+}
+
+#[tokio::test]
+async fn json_response_includes_webdav_false_when_disabled() {
+    let env = TestEnv::new(); // no .webdav()
+    env.write("file.txt", "hello");
+    let json = env.xhr("/").await.json().await;
+    assert_eq!(json["webdav"], false);
+    assert_eq!(json["webdav_auth"], false);
+}
+
+#[tokio::test]
+async fn json_response_includes_webdav_auth_true_when_configured() {
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "hello");
+    let json = env.xhr("/").await.json().await;
+    assert_eq!(json["webdav"], true);
+    assert_eq!(json["webdav_auth"], true);
+}
+
+#[tokio::test]
+async fn json_response_subdir_includes_webdav_fields() {
+    let env = TestEnv::new().webdav();
+    env.mkdir("subdir");
+    env.write("subdir/file.txt", "hello");
+    let json = env.xhr("/subdir").await.json().await;
+    assert_eq!(json["webdav"], true);
+    assert_eq!(json["webdav_auth"], false);
+    assert!(json["entries"].is_array());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// --webui-auth: share WebDAV Basic Auth with browser GET/HEAD access
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn webui_auth_blocks_browser_get_without_credentials() {
+    let env = TestEnv::new().webdav().auth("admin", "secret").webui_auth();
+    env.write("file.txt", "hello");
+    env.get("/file.txt").await.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webui_auth_blocks_browser_directory_listing_without_credentials() {
+    let env = TestEnv::new().webdav().auth("admin", "secret").webui_auth();
+    env.write("file.txt", "data");
+    env.get("/").await.assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webui_auth_allows_browser_get_with_correct_credentials() {
+    let env = TestEnv::new().webdav().auth("admin", "secret").webui_auth();
+    env.write("file.txt", "hello");
+    let body = env
+        .authed("GET", "/file.txt", "", "admin", "secret")
+        .await
+        .assert_status(StatusCode::OK)
+        .text()
+        .await;
+    assert_eq!(body, "hello");
+}
+
+#[tokio::test]
+async fn webui_auth_rejects_browser_get_with_wrong_credentials() {
+    let env = TestEnv::new().webdav().auth("admin", "secret").webui_auth();
+    env.write("file.txt", "hello");
+    env.authed("GET", "/file.txt", "", "admin", "wrong")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webui_auth_response_includes_challenge_header() {
+    let env = TestEnv::new().webdav().auth("admin", "secret").webui_auth();
+    env.write("file.txt", "data");
+    let resp = env.get("/").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let challenge = resp
+        .0
+        .headers()
+        .get("WWW-Authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(challenge.starts_with("Basic"));
+}
+
+#[tokio::test]
+async fn webui_auth_off_by_default_lets_browser_get_without_credentials() {
+    // --webdav-user alone (without --webui-auth) must not block browser GET.
+    let env = TestEnv::new().webdav().auth("admin", "secret");
+    env.write("file.txt", "hello");
+    let body = env.get("/file.txt").await.assert_status(StatusCode::OK).text().await;
+    assert_eq!(body, "hello");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Server lifecycle (real listener + graceful shutdown)
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod lifecycle {
+    use echofs::config::ServerConfig;
+    use echofs::logging::LogTarget;
+    use echofs::server;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    fn test_config(root: std::path::PathBuf) -> ServerConfig {
+        ServerConfig {
+            root,
+            bind: "127.0.0.1".to_string(),
+            port: 0, // OS-assigned ephemeral port
+            show_hidden: false,
+            max_depth: -1,
+            speed_limit: None,
+            webdav: false,
+            webdav_user: None,
+            webdav_pass: None,
+            webui_auth: false,
+        }
+    }
+
+    /// Issue a raw HTTP/1.0 GET over a real TCP connection and return the
+    /// response text. HTTP/1.0 so the server closes the connection on
+    /// completion, giving us a clean EOF to read to.
+    fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        write!(stream, "GET {} HTTP/1.0\r\nHost: localhost\r\n\r\n", path).expect("write");
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).expect("read");
+        buf
+    }
+
+    #[tokio::test]
+    async fn server_starts_serves_and_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("hello.txt"), "hi there").unwrap();
+
+        let handle = server::run(test_config(root), LogTarget::Off)
+            .await
+            .expect("server should bind");
+        let addr = handle.local_addr;
+
+        // Port 0 must resolve to a real assigned port.
+        assert_ne!(addr.port(), 0, "ephemeral port should be assigned");
+
+        // A blocking socket read can't run on the async worker without
+        // stalling the runtime, so do the request on a blocking thread.
+        let body = tokio::task::spawn_blocking(move || http_get(addr, "/hello.txt"))
+            .await
+            .unwrap();
+        assert!(body.contains("200 OK"), "expected 200, got:\n{}", body);
+        assert!(body.contains("hi there"), "expected file body, got:\n{}", body);
+
+        // Graceful shutdown completes.
+        handle.stop().await;
+
+        // After shutdown the port should no longer accept connections.
+        assert!(
+            TcpStream::connect(addr).is_err(),
+            "server should refuse connections after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_failure_returns_error_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Bind a first server to an ephemeral port…
+        let first = server::run(test_config(root.clone()), LogTarget::Off)
+            .await
+            .expect("first bind ok");
+        let used_port = first.local_addr.port();
+
+        // …then try to bind a second to the same port → should Err, not panic/exit.
+        let mut cfg = test_config(root);
+        cfg.port = used_port;
+        let result = server::run(cfg, LogTarget::Off).await;
+        assert!(result.is_err(), "binding an in-use port should fail");
+
+        first.stop().await;
+    }
+
+    /// Regression: a heavily throttled in-flight download must not make
+    /// `stop()` hang. Before the fix, axum's graceful shutdown waited for the
+    /// slow connection task to finish streaming (hours at 1 KB/s), so `stop()`
+    /// — and thus the GUI thread that awaited it — froze. `stop()` must now be
+    /// bounded and return promptly.
+    #[tokio::test]
+    async fn stop_does_not_hang_with_throttled_inflight_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // ~512 KB at 1 KB/s ≈ 8.5 minutes to drain — far longer than any
+        // acceptable shutdown wait.
+        std::fs::write(root.join("big.bin"), vec![b'x'; 512 * 1024]).unwrap();
+
+        let mut cfg = test_config(root);
+        cfg.speed_limit = Some(1024); // 1 KB/s
+        let handle = server::run(cfg, LogTarget::Off).await.expect("bind");
+        let addr = handle.local_addr;
+
+        // Open a connection and read only the first few bytes, leaving the
+        // throttled body streaming in flight. Keep the stream alive for the
+        // duration of the test by moving it into the blocking task.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let inflight = tokio::task::spawn_blocking(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            write!(stream, "GET /big.bin HTTP/1.0\r\nHost: localhost\r\n\r\n").expect("write");
+            let mut one = [0u8; 1];
+            let _ = stream.read(&mut one); // block until first throttled byte
+            let _ = started_tx.send(());
+            // Hold the connection open briefly so it is genuinely in-flight
+            // while we call stop().
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            drop(stream);
+        });
+
+        // Ensure the request is actually being served before stopping.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), started_rx).await;
+
+        // The whole point: stop() must return well before the body could drain.
+        let stop_result =
+            tokio::time::timeout(std::time::Duration::from_secs(8), handle.stop()).await;
+        assert!(
+            stop_result.is_ok(),
+            "stop() hung with a throttled in-flight request"
+        );
+
+        // Port must be released after stop.
+        assert!(
+            TcpStream::connect(addr).is_err(),
+            "server should refuse connections after stop"
+        );
+
+        let _ = inflight.await;
+    }
+
+    /// Regression mirroring the GUI window-close path: the GUI calls
+    /// `handle.abort()` and then drops its `Arc<Runtime>` on the main thread.
+    /// Neither step may block on an orphaned throttled connection task
+    /// (axum detaches connection tasks, so aborting the serve task does not
+    /// cancel an in-flight download). This test builds a real runtime like the
+    /// GUI does (not `#[tokio::test]`), starts a throttled transfer, then times
+    /// `abort()` + runtime drop.
+    #[test]
+    fn gui_close_path_abort_then_runtime_drop_is_fast() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("big.bin"), vec![b'x'; 512 * 1024]).unwrap();
+
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+
+        let mut cfg = test_config(root);
+        cfg.speed_limit = Some(1024); // 1 KB/s
+
+        let handle = rt
+            .block_on(server::run(cfg, LogTarget::Off))
+            .expect("bind");
+        let addr = handle.local_addr;
+
+        // Kick off an in-flight throttled request from a plain OS thread.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let inflight = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            write!(stream, "GET /big.bin HTTP/1.0\r\nHost: localhost\r\n\r\n").expect("write");
+            let mut one = [0u8; 1];
+            let _ = stream.read(&mut one); // first throttled byte
+            let _ = started_tx.send(());
+            std::thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+        let _ = started_rx.recv_timeout(Duration::from_secs(5));
+
+        // The GUI Stop / on_exit path: synchronous abort must be instant.
+        let t0 = Instant::now();
+        handle.abort();
+        let abort_elapsed = t0.elapsed();
+        assert!(
+            abort_elapsed < Duration::from_secs(1),
+            "abort() took {:?} — should be instant",
+            abort_elapsed
+        );
+
+        // Then dropping the runtime (EchoApp drop on window close) must not
+        // block on the orphaned throttled connection task.
+        let t1 = Instant::now();
+        drop(rt);
+        let drop_elapsed = t1.elapsed();
+        assert!(
+            drop_elapsed < Duration::from_secs(3),
+            "runtime drop took {:?} — hung on the in-flight throttled task",
+            drop_elapsed
+        );
+
+        let _ = inflight.join();
+    }
+
+    /// Regression for the GUI Stop→Start cycle on a fixed port: after aborting
+    /// with a throttled request in flight, restarting on the *same* port must
+    /// succeed (the listener socket is released promptly, not stuck because an
+    /// orphaned connection task lingers).
+    #[test]
+    fn restart_same_port_after_abort_with_inflight() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("big.bin"), vec![b'x'; 512 * 1024]).unwrap();
+
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+
+        // First bind on an ephemeral port to discover a free port number, then
+        // reuse that exact port for the restart.
+        let mut cfg = test_config(root.clone());
+        cfg.speed_limit = Some(1024);
+        let handle = rt.block_on(server::run(cfg, LogTarget::Off)).expect("bind 1");
+        let port = handle.local_addr.port();
+        let addr = handle.local_addr;
+
+        // In-flight throttled request.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let inflight = std::thread::spawn(move || {
+            if let Ok(mut stream) = TcpStream::connect(addr) {
+                let _ = write!(stream, "GET /big.bin HTTP/1.0\r\nHost: localhost\r\n\r\n");
+                let mut one = [0u8; 1];
+                let _ = stream.read(&mut one);
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+        let _ = started_rx.recv_timeout(Duration::from_secs(5));
+
+        // Stop (abort), then immediately restart on the same fixed port.
+        handle.abort();
+
+        let mut cfg2 = test_config(root);
+        cfg2.port = port;
+        cfg2.speed_limit = Some(1024);
+
+        // Retry briefly: the OS may need a moment to release the socket.
+        let mut restart = None;
+        for _ in 0..20 {
+            match rt.block_on(server::run(cfg2.clone(), LogTarget::Off)) {
+                Ok(h) => {
+                    restart = Some(h);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        assert!(
+            restart.is_some(),
+            "could not rebind port {} after abort with in-flight request",
+            port
+        );
+
+        restart.unwrap().abort();
+        drop(rt);
+        let _ = inflight.join();
+    }
+
+    /// After the GUI Stop button (`abort()` with the runtime still alive), the
+    /// orphaned throttled connection task must be harmless: the port is freed
+    /// immediately and a fresh server can bind and serve on a new port. This
+    /// documents that Stop does not leave the app in a broken state even though
+    /// the in-flight connection task lingers until its client disconnects.
+    #[test]
+    fn server_usable_again_after_abort_with_lingering_connection() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join("big.bin"), vec![b'x'; 512 * 1024]).unwrap();
+        std::fs::write(root.join("small.txt"), "second server ok").unwrap();
+
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+
+        let mut cfg = test_config(root.clone());
+        cfg.speed_limit = Some(1024);
+        let handle = rt.block_on(server::run(cfg, LogTarget::Off)).expect("bind 1");
+        let addr1 = handle.local_addr;
+
+        // Leave a throttled request in flight and DON'T close it (the client
+        // keeps holding the socket, so the orphaned task would keep streaming).
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let keepalive = std::thread::spawn(move || {
+            if let Ok(mut stream) = TcpStream::connect(addr1) {
+                let _ = write!(stream, "GET /big.bin HTTP/1.0\r\nHost: localhost\r\n\r\n");
+                let mut one = [0u8; 1];
+                let _ = stream.read(&mut one);
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_secs(3));
+                drop(stream);
+            }
+        });
+        let _ = started_rx.recv_timeout(Duration::from_secs(5));
+
+        handle.abort();
+
+        // A brand-new server on a fresh ephemeral port must work normally.
+        let handle2 = rt
+            .block_on(server::run(test_config(root), LogTarget::Off))
+            .expect("bind 2");
+        let addr2 = handle2.local_addr;
+        assert_ne!(addr1.port(), addr2.port());
+
+        let body = std::thread::spawn(move || http_get(addr2, "/small.txt"))
+            .join()
+            .unwrap();
+        assert!(body.contains("200 OK"), "second server should serve; got:\n{}", body);
+        assert!(body.contains("second server ok"));
+
+        handle2.abort();
+        drop(rt);
+        let _ = keepalive.join();
+    }
+}
+
+/// Regression: the WebDAV PROPFIND self/directory href must be normalized the
+/// same way child hrefs are. Before the fix, `PROPFIND /sub/` produced a self
+/// href of `/sub//` (and `/sub//` produced `/sub///`). A WebDAV client (e.g.
+/// Windows Explorer) then caches that doubled-slash URL and, on reopen, treats
+/// it as a distinct resource — the folder appears to show itself duplicated.
+/// The self href now collapses doubled/leading/trailing slashes into a single
+/// clean collection href (`/sub/`).
+#[tokio::test]
+async fn webdav_propfind_self_href_normalized() {
+    let env = TestEnv::new().webdav();
+    env.write("sub/inner.txt", "data");
+    env.mkdir("sub/child");
+
+    for uri in ["/sub", "/sub/", "/sub//"] {
+        let body = env.propfind(uri, "1").await.assert_status(StatusCode::MULTI_STATUS).text().await;
+        // The first <D:href> belongs to the requested directory itself.
+        let first_href = body
+            .lines()
+            .find_map(|l| {
+                let t = l.trim();
+                t.strip_prefix("<D:href>").and_then(|s| s.strip_suffix("</D:href>"))
+            })
+            .expect("multistatus must contain a href");
+        assert_eq!(first_href, "/sub/", "uri={uri} self href must be a clean collection href");
+        // No doubled slashes anywhere in the response.
+        assert!(!body.contains("//"), "uri={uri} response must not contain doubled slashes");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Folder ZIP download (GET <dir>?download=zip)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Parse body bytes as a ZIP and return sorted entry names.
+fn zip_names(bytes: &[u8]) -> Vec<String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))
+        .expect("body must be a valid ZIP archive");
+    let mut names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).expect("entry").name().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Extract a single text entry from ZIP body bytes.
+fn zip_entry_text(bytes: &[u8], name: &str) -> String {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))
+        .expect("body must be a valid ZIP archive");
+    let mut s = String::new();
+    archive
+        .by_name(name)
+        .unwrap_or_else(|_| panic!("missing ZIP entry {}", name))
+        .read_to_string(&mut s)
+        .expect("read entry");
+    s
+}
+
+#[tokio::test]
+async fn zip_download_streams_folder_tree() {
+    let env = TestEnv::new();
+    env.write("docs/a.txt", "alpha");
+    env.write("docs/sub/b.txt", "beta");
+
+    let resp = env
+        .get("/docs/?download=zip")
+        .await
+        .assert_status(StatusCode::OK)
+        .assert_header("content-type", "application/zip")
+        .assert_header_contains("content-disposition", "attachment")
+        .assert_header_contains("content-disposition", "filename*=UTF-8''docs.zip");
+    assert!(
+        resp.header("content-length").is_none(),
+        "ZIP must stream chunked (no Content-Length)"
+    );
+
+    let body = resp.bytes().await;
+    assert_eq!(
+        zip_names(&body),
+        vec!["docs/", "docs/a.txt", "docs/sub/", "docs/sub/b.txt"]
+    );
+    assert_eq!(zip_entry_text(&body, "docs/a.txt"), "alpha");
+    assert_eq!(zip_entry_text(&body, "docs/sub/b.txt"), "beta");
+}
+
+#[tokio::test]
+async fn zip_download_root_folder() {
+    let env = TestEnv::new();
+    env.write("top.txt", "t");
+
+    let resp = env
+        .get("/?download=zip")
+        .await
+        .assert_status(StatusCode::OK)
+        .assert_header("content-type", "application/zip");
+    let names = zip_names(&resp.bytes().await);
+    assert!(
+        names.iter().any(|n| n.ends_with("/top.txt")),
+        "root archive must contain top.txt under the root folder name, got {:?}",
+        names
+    );
+}
+
+#[tokio::test]
+async fn zip_download_cjk_name_in_content_disposition() {
+    let env = TestEnv::new();
+    env.write("文档/f.txt", "x");
+
+    // /%E6%96%87%E6%A1%A3/ = /文档/
+    let resp = env
+        .get("/%E6%96%87%E6%A1%A3/?download=zip")
+        .await
+        .assert_status(StatusCode::OK);
+    resp.assert_header_contains(
+        "content-disposition",
+        "filename*=UTF-8''%E6%96%87%E6%A1%A3.zip",
+    );
+}
+
+#[tokio::test]
+async fn zip_download_excludes_hidden_by_default() {
+    let env = TestEnv::new();
+    env.write("docs/visible.txt", "v");
+    env.write("docs/.hidden.txt", "h");
+    env.write("docs/.hdir/inner.txt", "i");
+
+    let body = env.get("/docs/?download=zip").await.assert_status(StatusCode::OK).bytes().await;
+    assert_eq!(zip_names(&body), vec!["docs/", "docs/visible.txt"]);
+}
+
+#[tokio::test]
+async fn zip_download_includes_hidden_when_enabled() {
+    let env = TestEnv::new().show_hidden();
+    env.write("docs/.hidden.txt", "h");
+
+    let body = env.get("/docs/?download=zip").await.assert_status(StatusCode::OK).bytes().await;
+    assert_eq!(zip_names(&body), vec!["docs/", "docs/.hidden.txt"]);
+}
+
+#[tokio::test]
+async fn zip_download_respects_max_depth() {
+    let env = TestEnv::new().max_depth(1);
+    env.write("docs/top.txt", "t");
+    env.write("docs/deep/x.txt", "x");
+
+    let body = env.get("/docs/?download=zip").await.assert_status(StatusCode::OK).bytes().await;
+    // docs is at depth 1; docs/deep (depth 2) is beyond --max-depth 1.
+    assert_eq!(zip_names(&body), vec!["docs/", "docs/top.txt"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn zip_download_skips_symlinks_escaping_root() {
+    let env = TestEnv::new();
+    env.write("docs/ok.txt", "o");
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), "s").unwrap();
+    std::os::unix::fs::symlink(outside.path(), env.root.join("docs/escape")).unwrap();
+
+    let body = env.get("/docs/?download=zip").await.assert_status(StatusCode::OK).bytes().await;
+    assert_eq!(zip_names(&body), vec!["docs/", "docs/ok.txt"]);
+}
+
+#[tokio::test]
+async fn zip_download_param_on_file_serves_file_normally() {
+    let env = TestEnv::new();
+    env.write("f.txt", "plain data");
+
+    let resp = env.get("/f.txt?download=zip").await.assert_status(StatusCode::OK);
+    assert_ne!(resp.header("content-type").as_deref(), Some("application/zip"));
+    assert_eq!(resp.text().await, "plain data");
+}
+
+#[tokio::test]
+async fn zip_download_nonexistent_dir_is_404() {
+    let env = TestEnv::new();
+    env.get("/nope/?download=zip").await.assert_status(StatusCode::NOT_FOUND);
+}
+
+/// HEAD on a zip URL returns the download headers but must not start any
+/// walk/compression work (download managers probe with HEAD).
+#[tokio::test]
+async fn zip_download_head_returns_headers_without_body() {
+    let env = TestEnv::new();
+    env.write("docs/f.txt", "x");
+
+    let resp = env
+        .head("/docs/?download=zip")
+        .await
+        .assert_status(StatusCode::OK)
+        .assert_header("content-type", "application/zip")
+        .assert_header_contains("content-disposition", "filename*=UTF-8''docs.zip");
+    assert!(resp.bytes().await.is_empty(), "HEAD must not produce a body");
+}
+
+/// A throttled server must also throttle ZIP streams (the limiter wraps the
+/// archive body the same way it wraps file bodies).
+#[tokio::test]
+async fn zip_download_applies_speed_limit() {
+    let env = TestEnv::new();
+    // 192 KiB at 128 KiB/s: the token bucket starts full with 1s worth of
+    // tokens (128 KiB), so ~64 KiB must wait for refills → ≥ ~0.3s total.
+    // An unthrottled transfer of this size completes in milliseconds.
+    // Pseudo-random bytes + a "stored" extension keep the archive body at
+    // full size (deflate would crush repeated bytes to ~nothing).
+    let mut seed: u32 = 0x1234_5678;
+    let data: Vec<u8> = (0..192 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    env.write_bytes("docs/photo.jpg", &data);
+
+    let state = Arc::new(AppState {
+        root: env.root.clone(),
+        show_hidden: false,
+        max_depth: -1,
+        speed_limit: Some(128 * 1024),
+        webdav: false,
+        webdav_user: None,
+        webdav_pass: None,
+        webui_auth: false,
+    });
+    let router = Router::new()
+        .route("/", get(handlers::serve_index))
+        .route("/{*path}", get(handlers::serve_path))
+        .with_state(state);
+
+    let start = std::time::Instant::now();
+    let resp = router
+        .oneshot(Request::get("/docs/?download=zip").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(300),
+        "192 KiB at 128 KiB/s should be throttled, finished in {:?}",
+        elapsed
+    );
+    assert!(zip_names(&bytes).contains(&"docs/photo.jpg".to_string()));
+}
