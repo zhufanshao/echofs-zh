@@ -6,48 +6,44 @@ Web 界面全面中文化,**musl 静态链接**编译,单文件二进制、零�
 适用于普通 Linux 以及 **glibc 较旧的精简环境**(BusyBox / NAS / 路由器 / 低配小主机等),
 即使原版因 GLIBC 版本过旧无法运行,本版也能直接跑。
 
-## 特性
-
-- Web 界面全面中文化:上传 / 下载 / 预览 / 重命名 / 移动 / 删除 / ZIP 打包下载 / 二维码分享
-- 文件浏览(列表 / 网格视图)、排序、拖拽上传、多文件并发上传
-- 支持 WebDAV,可挂载为 Windows 网络驱动器、手机 / 电视 / 网盘客户端
-- 内置 HTTP 认证(用户名 / 密码)、目录隐藏、下载限速、访客只读等选项
-- 单文件、零依赖、静态链接,拷过去就能用
-
 ## 下载
 
 前往 [Releases](https://github.com/zhufanshao/echofs-zh/releases) 下载最新版:
 
-| 文件 | 说明 |
-| --- | --- |
-| `echofs-linux-amd64-zh` | Linux x86_64(musl 静态链接,推荐) |
+| 文件 | 平台 | 说明 |
+| --- | --- | --- |
+| `echofs-linux-amd64-zh` | Linux x86_64 | musl 静态链接,glibc 2.20 旧环境也能直接运行 |
+| `echofs-windows-x86_64-zh.exe` | Windows x86_64 | 命令行或双击运行 |
+| `echofs-macos-arm64-zh` | macOS Apple Silicon (M 系列) | 原生 arm64 版本 |
+| `echofs-macos-x64-zh` | macOS Intel | x86_64 版本 |
 
-校验值(请核对,防止文件损坏或篡改):
-
-```
-SHA256: E844D6E2AA567F43A76C4C369512EB88CC0130CD5DB51368F2B02A1DB9776AFE
-MD5:    F07C3B17BCBD29C38F68483B15C1780A
-```
+校验值(SHA256,下载后请核对):
 
 ```bash
 echo "E844D6E2AA567F43A76C4C369512EB88CC0130CD5DB51368F2B02A1DB9776AFE  echofs-linux-amd64-zh" | sha256sum -c -
+echo "F7BE0D80138AEE36771D2E1E9F1D27A3153B2928DBC6B26D31315F87A8F310CB  echofs-windows-x86_64-zh.exe" | sha256sum -c -
+echo "3B6471CEB7DA9BA5B1C041A7AA8C58637A0AD88109C8182966B768C11015A4A4  echofs-macos-arm64-zh" | sha256sum -c -
+echo "04DE320417E63D11F147EDB802639EC3C9982C36D6A4D0C9B06B767C80BE478B  echofs-macos-x64-zh" | sha256sum -c -
 ```
 
 ## 使用方法
 
 ```bash
-chmod +x echofs-linux-amd64-zh
-# 共享当前目录
+# Linux / macOS
+chmod +x echofs-*-zh
 ./echofs-linux-amd64-zh -r .
-# 共享指定目录并指定端口
-./echofs-linux-amd64-zh -r /data/share -p 8080
-# 绑定地址 + 开启登录认证
-./echofs-linux-amd64-zh -r /data/share -b 0.0.0.0 -u admin -p password
+./echofs-macos-arm64-zh -r /data/share -p 8080
+
+# Windows
+echofs-windows-x86_64-zh.exe -r D:\share -p 8080
 ```
 
 - 浏览器访问 `http://IP:8080` 即可浏览 / 上传 / 下载文件
 - Windows 资源管理器地址栏输入 `\\IP@8080\` 可挂载为 WebDAV 网络驱动器
-- 完整参数见 `./echofs-linux-amd64-zh --help`
+- 完整参数见 `./echofs-xxx --help`
+
+> **macOS 提示**:二进制未签名,首次运行时如被 Gatekeeper 拦截,
+> 在终端执行 `xattr -d com.apple.quarantine ./echofs-macos-*-zh` 后即可打开。
 
 ## 构建方法(从源码)
 
@@ -55,6 +51,9 @@ chmod +x echofs-linux-amd64-zh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
+
+本仓库自带 GitHub Actions 工作流(`.github/workflows/build-macos.yml`),
+每次推送 `main` 会自动在 macOS 官方构建机上编译并上传双架构版本。
 
 ## 与上游的差异
 
