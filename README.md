@@ -45,6 +45,9 @@ echofs-windows-x86_64-zh.exe -r D:\share -p 8080
 > **macOS 提示**:二进制未签名,首次运行时如被 Gatekeeper 拦截,
 > 在终端执行 `xattr -d com.apple.quarantine ./echofs-macos-*-zh` 后即可打开。
 
+>
+> 详细的**各平台使用教程**:**WebDAV 挂载为网盘、开机自启、完整参数说明、常见问题**见 **[USAGE.md](USAGE.md)**。
+
 ## 构建方法(从源码)
 
 ```bash
